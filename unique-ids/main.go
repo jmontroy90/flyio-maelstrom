@@ -23,9 +23,6 @@ func main() {
 		id++
 		body["type"] = "generate_ok"
 		body["id"] = fmt.Sprintf("%v-%v", n.ID(), id)
-
-		n.Send()
-		n.RPC()
 		// Echo the original message back with the updated message type.
 		return n.Reply(msg, body)
 	})

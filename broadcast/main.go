@@ -41,6 +41,15 @@ func (bn *BroadcastNode) broadcastHandler(msg maelstrom.Message) error {
 		return bn.Node.Reply(msg, resp) // no work to do
 	}
 	bn.Store[int(m)] = struct{}{}
+	for _, nid := range bn.Node.NodeIDs() {
+		// TODO: Much cleaner handling needed + better understanding of different failure modes.
+		_ = bn.Node.RPC(nid, body, func(msg maelstrom.Message) error {
+			if err := msg.RPCError(); err != nil {
+				return err
+			}
+			return nil
+		})
+	}
 	return bn.Node.Reply(msg, resp)
 }
 

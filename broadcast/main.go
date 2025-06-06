@@ -14,18 +14,41 @@ import (
 type BroadcastNode struct {
 	node *maelstrom.Node
 
-	store      map[int]struct{}
-	storeMutex sync.RWMutex
+	// TODO: could probably consolidate store + gossipState into one map?
+	// TODO: investigate sync.Map instead of manual locking
+	store    map[int]struct{}
+	storeMut sync.RWMutex
 
-	gossipState map[int]map[string]struct{} // Message -> [nodes it hasn't reached yet]
-	gossipMutex sync.Mutex
+	gossipCh    chan gossipRequest
+	gossipState map[nodeMsg]struct{}
+	gossipMut   sync.RWMutex
+
+	retryCh       chan gossipRequest
+	retryInterval *time.Ticker
+}
+
+type gossipRequest struct {
+	msg        int
+	node       string
+	retryAt    time.Time
+	numRetries int
+}
+
+type nodeMsg struct {
+	msg  int
+	node string
 }
 
 func NewBroadcastNode() *BroadcastNode {
 	bn := BroadcastNode{
 		node:        maelstrom.NewNode(),
-		gossipState: make(map[int]map[string]struct{}),
+		gossipState: make(map[nodeMsg]struct{}),
 		store:       make(map[int]struct{}),
+		// TODO: Need to figure out how to calibrate the size of both of these channels; maybe a Stats() goroutine?
+		gossipCh: make(chan gossipRequest, 1000),
+		retryCh:  make(chan gossipRequest, 1000),
+		// TODO: more configuration on retry intervals, etc.
+		retryInterval: time.NewTicker(500 * time.Millisecond),
 	}
 	bn.node.Handle("broadcast", bn.broadcastHandler)
 	bn.node.Handle("read", bn.readHandler)
@@ -33,6 +56,7 @@ func NewBroadcastNode() *BroadcastNode {
 	return &bn
 }
 
+// TODO: lots of little helpers and code refactoring could help this all a lot
 func (bn *BroadcastNode) broadcastHandler(msg maelstrom.Message) error {
 	var body map[string]any
 	if err := json.Unmarshal(msg.Body, &body); err != nil {
@@ -43,16 +67,17 @@ func (bn *BroadcastNode) broadcastHandler(msg maelstrom.Message) error {
 		return fmt.Errorf("can't parse input message")
 	}
 	resp := map[string]any{"type": "broadcast_ok"}
-	bn.storeMutex.RLock()
+	bn.storeMut.RLock()
 	_, ok = bn.store[int(m)]
-	bn.storeMutex.RUnlock()
+	bn.storeMut.RUnlock()
 	if ok {
+		// DO NOT LOCK THIS CALL ACCIDENTALLY!
 		return bn.node.Reply(msg, resp) // no work to do
 	}
-	bn.storeMutex.Lock()
+	bn.storeMut.Lock()
 	bn.store[int(m)] = struct{}{}
-	bn.storeMutex.Unlock()
-	bn.addToGossipState(int(m))
+	bn.storeMut.Unlock()
+	bn.sendToGossip(int(m))
 	return bn.node.Reply(msg, resp)
 }
 
@@ -69,58 +94,79 @@ func (bn *BroadcastNode) readHandler(msg maelstrom.Message) error {
 	return bn.node.Reply(msg, resp)
 }
 
+// TODO: actually like use this
 func (bn *BroadcastNode) topologyHandler(msg maelstrom.Message) error {
 	return bn.node.Reply(msg, map[string]any{"type": "topology_ok"})
 }
 
-func (bn *BroadcastNode) addToGossipState(m int) {
-	remaining := make(map[string]struct{})
+func (bn *BroadcastNode) sendToGossip(m int) {
+	// Create individual broadcast requests for all nodes EXCEPT this one.
 	for _, nid := range bn.node.NodeIDs() {
 		if nid == bn.node.ID() {
 			continue
 		}
-		remaining[nid] = struct{}{}
+		bn.gossipCh <- gossipRequest{msg: m, node: nid, retryAt: time.Now()}
 	}
-	bn.gossipMutex.Lock()
-	defer bn.gossipMutex.Unlock()
-	bn.gossipState[m] = remaining
 }
 
-func (bn *BroadcastNode) gossip(ctx context.Context, tick *time.Ticker) {
+func (bn *BroadcastNode) gossipHandler(ctx context.Context) {
 	for {
 		select {
-		// TODO: general concurrency sanitization re: ctx.Done(), maybe other things
-		// TODO: should this be channel-based, rather than sync-based?
-		case <-tick.C:
-			// TODO: Do we really wanna try to send ALL gossip state every tick?
-			for m, nodes := range bn.gossipState {
-				for nid := range nodes {
-					_ = bn.node.RPC(nid, map[string]any{"type": "broadcast", "message": m}, bn.gossipResponseHandler(m))
+		case gr := <-bn.gossipCh:
+			bn.gossipMut.RLock()
+			_, ok := bn.gossipState[nodeMsg{msg: gr.msg, node: gr.node}]
+			bn.gossipMut.RUnlock()
+			if ok {
+				continue
+			}
+			body := map[string]any{"type": "broadcast", "message": gr.msg}
+			_ = bn.node.RPC(gr.node, body, bn.gossipResponseHandler(gr))
+			gr.numRetries++ // simple linearly-growing backoff for retries
+			// TODO: configurable
+			gr.retryAt = gr.retryAt.Add(100 * time.Duration(gr.numRetries) * time.Millisecond)
+			bn.retryCh <- gr // back into the event loop
+		}
+	}
+}
+
+func (bn *BroadcastNode) retryHandler(ctx context.Context) {
+	for {
+		select {
+		case <-bn.retryInterval.C: // every interval, check what messages are ready to be processed.
+			queueLen := len(bn.retryCh)
+			// We run through the retry queue as it exists at the start of the poll interval, and no more;
+			// since we're sending messages back into the channel, we can't just carelessly range without creating a "hot loop".
+			for i := 0; i < queueLen; i++ {
+				select {
+				case gr := <-bn.retryCh:
+					if time.Now().After(gr.retryAt) {
+						bn.gossipCh <- gr
+					} else {
+						bn.retryCh <- gr
+					}
 				}
 			}
 		}
 	}
 }
 
-func (bn *BroadcastNode) gossipResponseHandler(m int) maelstrom.HandlerFunc {
+func (bn *BroadcastNode) gossipResponseHandler(gr gossipRequest) maelstrom.HandlerFunc {
 	return func(msg maelstrom.Message) error {
 		if msg.Type() == "broadcast_ok" {
-			bn.gossipMutex.Lock()
-			delete(bn.gossipState[m], msg.Src)
-			bn.gossipMutex.Unlock()
-		}
-		if len(bn.gossipState[m]) == 0 {
-			bn.gossipMutex.Lock()
-			delete(bn.gossipState, m)
-			bn.gossipMutex.Unlock()
+			bn.gossipMut.Lock()
+			bn.gossipState[nodeMsg{msg: gr.msg, node: gr.node}] = struct{}{}
+			bn.gossipMut.Unlock()
 		}
 		return nil
 	}
 }
 
+// TODO: clean Goroutine teardown via ctx
 func main() {
 	n := NewBroadcastNode()
-	go n.gossip(context.Background(), time.NewTicker(500*time.Millisecond))
+	ctx := context.Background()
+	go n.gossipHandler(ctx)
+	go n.retryHandler(ctx)
 	if err := n.node.Run(); err != nil {
 		log.Fatal(err)
 	}

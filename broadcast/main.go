@@ -12,21 +12,13 @@ import (
 )
 
 type BroadcastNode struct {
-	node *maelstrom.Node
-
+	node            *maelstrom.Node
 	currentTopology map[string][]string
-
-	// TODO: could probably consolidate store + gossipState into one map?
-	// TODO: investigate sync.Map instead of manual locking
-	store    map[int]struct{}
-	storeMut sync.RWMutex
-
-	gossipCh    chan gossipRequest
-	gossipState map[nodeMsg]struct{}
-	gossipMut   sync.RWMutex
-
-	retryCh       chan gossipRequest
-	retryInterval *time.Ticker
+	store           *sync.Map
+	gossipCh        chan gossipRequest
+	gossipState     *sync.Map
+	retryCh         chan gossipRequest
+	retryInterval   *time.Ticker
 }
 
 type gossipRequest struct {
@@ -44,8 +36,8 @@ type nodeMsg struct {
 func NewBroadcastNode() *BroadcastNode {
 	bn := BroadcastNode{
 		node:        maelstrom.NewNode(),
-		gossipState: make(map[nodeMsg]struct{}),
-		store:       make(map[int]struct{}),
+		gossipState: &sync.Map{},
+		store:       &sync.Map{},
 		// TODO: Need to figure out how to calibrate the size of both of these channels; maybe a Stats() goroutine?
 		gossipCh: make(chan gossipRequest, 5000),
 		retryCh:  make(chan gossipRequest, 5000),
@@ -69,16 +61,12 @@ func (bn *BroadcastNode) broadcastHandler(msg maelstrom.Message) error {
 		return fmt.Errorf("can't parse input message")
 	}
 	resp := map[string]any{"type": "broadcast_ok"}
-	bn.storeMut.RLock()
-	_, ok = bn.store[int(m)]
-	bn.storeMut.RUnlock()
+	_, ok = bn.store.Load(int(m))
 	if ok {
 		// DO NOT LOCK THIS CALL ACCIDENTALLY!
 		return bn.node.Reply(msg, resp) // no work to do
 	}
-	bn.storeMut.Lock()
-	bn.store[int(m)] = struct{}{}
-	bn.storeMut.Unlock()
+	bn.store.Store(int(m), struct{}{})
 	bn.sendToNeighbors(int(m))
 	return bn.node.Reply(msg, resp)
 }
@@ -89,11 +77,10 @@ func (bn *BroadcastNode) readHandler(msg maelstrom.Message) error {
 		return err
 	}
 	var out []int
-	bn.storeMut.RLock()
-	for k, _ := range bn.store {
-		out = append(out, k)
-	}
-	bn.storeMut.RUnlock()
+	bn.store.Range(func(key, value any) bool {
+		out = append(out, key.(int))
+		return true
+	})
 	resp := map[string]any{"type": "read_ok", "messages": out}
 	return bn.node.Reply(msg, resp)
 }
@@ -149,9 +136,7 @@ func (bn *BroadcastNode) gossipHandler(ctx context.Context) {
 	for {
 		select {
 		case gr := <-bn.gossipCh:
-			bn.gossipMut.RLock()
-			_, ok := bn.gossipState[nodeMsg{msg: gr.msg, node: gr.node}]
-			bn.gossipMut.RUnlock()
+			_, ok := bn.gossipState.Load(nodeMsg{msg: gr.msg, node: gr.node})
 			if ok {
 				continue
 			}
@@ -193,9 +178,7 @@ func (bn *BroadcastNode) retryHandler(ctx context.Context) {
 func (bn *BroadcastNode) gossipResponseHandler(gr gossipRequest) maelstrom.HandlerFunc {
 	return func(msg maelstrom.Message) error {
 		if msg.Type() == "broadcast_ok" {
-			bn.gossipMut.Lock()
-			bn.gossipState[nodeMsg{msg: gr.msg, node: gr.node}] = struct{}{}
-			bn.gossipMut.Unlock()
+			bn.gossipState.Store(nodeMsg{msg: gr.msg, node: gr.node}, struct{}{})
 		}
 		return nil
 	}

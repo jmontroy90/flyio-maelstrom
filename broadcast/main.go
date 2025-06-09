@@ -14,6 +14,8 @@ import (
 type BroadcastNode struct {
 	node *maelstrom.Node
 
+	currentTopology map[string][]string
+
 	// TODO: could probably consolidate store + gossipState into one map?
 	// TODO: investigate sync.Map instead of manual locking
 	store    map[int]struct{}
@@ -45,8 +47,8 @@ func NewBroadcastNode() *BroadcastNode {
 		gossipState: make(map[nodeMsg]struct{}),
 		store:       make(map[int]struct{}),
 		// TODO: Need to figure out how to calibrate the size of both of these channels; maybe a Stats() goroutine?
-		gossipCh: make(chan gossipRequest, 1000),
-		retryCh:  make(chan gossipRequest, 1000),
+		gossipCh: make(chan gossipRequest, 5000),
+		retryCh:  make(chan gossipRequest, 5000),
 		// TODO: more configuration on retry intervals, etc.
 		retryInterval: time.NewTicker(500 * time.Millisecond),
 	}
@@ -77,7 +79,7 @@ func (bn *BroadcastNode) broadcastHandler(msg maelstrom.Message) error {
 	bn.storeMut.Lock()
 	bn.store[int(m)] = struct{}{}
 	bn.storeMut.Unlock()
-	bn.sendToGossip(int(m))
+	bn.sendToNeighbors(int(m))
 	return bn.node.Reply(msg, resp)
 }
 
@@ -87,21 +89,55 @@ func (bn *BroadcastNode) readHandler(msg maelstrom.Message) error {
 		return err
 	}
 	var out []int
+	bn.storeMut.RLock()
 	for k, _ := range bn.store {
 		out = append(out, k)
 	}
+	bn.storeMut.RUnlock()
 	resp := map[string]any{"type": "read_ok", "messages": out}
 	return bn.node.Reply(msg, resp)
 }
 
 // TODO: actually like use this
 func (bn *BroadcastNode) topologyHandler(msg maelstrom.Message) error {
+	var body map[string]any
+	if err := json.Unmarshal(msg.Body, &body); err != nil {
+		return err
+	}
+	topo := convertSliceMap(body["topology"])
+	bn.currentTopology = topo
 	return bn.node.Reply(msg, map[string]any{"type": "topology_ok"})
+}
+
+func convertSliceMap(input any) map[string][]string {
+	kvs := input.(map[string]interface{})
+	res := make(map[string][]string, len(kvs))
+	for k, vs := range kvs {
+		vsi := vs.([]interface{})
+		vss := make([]string, len(vsi))
+		for i, vi := range vsi {
+			if vs, ok := vi.(string); ok {
+				vss[i] = vs
+			}
+		}
+		res[k] = vss
+	}
+	return res // edge case: empty slice
 }
 
 func (bn *BroadcastNode) sendToGossip(m int) {
 	// Create individual broadcast requests for all nodes EXCEPT this one.
 	for _, nid := range bn.node.NodeIDs() {
+		if nid == bn.node.ID() {
+			continue
+		}
+		bn.gossipCh <- gossipRequest{msg: m, node: nid, retryAt: time.Now()}
+	}
+}
+
+func (bn *BroadcastNode) sendToNeighbors(m int) {
+	// Create individual broadcast requests for all nodes EXCEPT this one.
+	for _, nid := range bn.currentTopology[bn.node.ID()] {
 		if nid == bn.node.ID() {
 			continue
 		}
@@ -123,7 +159,11 @@ func (bn *BroadcastNode) gossipHandler(ctx context.Context) {
 			_ = bn.node.RPC(gr.node, body, bn.gossipResponseHandler(gr))
 			gr.numRetries++ // simple linearly-growing backoff for retries
 			// TODO: configurable
-			gr.retryAt = gr.retryAt.Add(100 * time.Duration(gr.numRetries) * time.Millisecond)
+			backoff := 100 * time.Duration(gr.numRetries) * time.Millisecond
+			if backoff > 500*time.Millisecond {
+				backoff = 500 * time.Millisecond
+			}
+			gr.retryAt = gr.retryAt.Add(backoff)
 			bn.retryCh <- gr // back into the event loop
 		}
 	}

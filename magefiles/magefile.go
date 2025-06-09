@@ -25,6 +25,7 @@ var (
 			"3a": {"--node-count", "1", "--time-limit", "20", "--rate", "10"},
 			"3b": {"--node-count", "5", "--time-limit", "20", "--rate", "10"},
 			"3c": {"--node-count", "5", "--time-limit", "20", "--rate", "10", "--nemesis", "partition"},
+			"3d": {"--node-count", "25", "--time-limit", "20", "--rate", "100", "--latency", "100"}, // still works if you add partition nemesis, just very slow
 		},
 	}
 )

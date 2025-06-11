@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"slices"
 	"sync"
 	"time"
 
@@ -67,7 +68,7 @@ func (bn *BroadcastNode) broadcastHandler(msg maelstrom.Message) error {
 		return bn.node.Reply(msg, resp) // no work to do
 	}
 	bn.store.Store(int(m), struct{}{})
-	bn.sendToNeighbors(int(m))
+	bn.sendToNeighbors(int(m), msg.Src)
 	return bn.node.Reply(msg, resp)
 }
 
@@ -122,10 +123,10 @@ func (bn *BroadcastNode) sendToGossip(m int) {
 	}
 }
 
-func (bn *BroadcastNode) sendToNeighbors(m int) {
-	// Create individual broadcast requests for all nodes EXCEPT this one.
+func (bn *BroadcastNode) sendToNeighbors(m int, srcNode string) {
 	for _, nid := range bn.currentTopology[bn.node.ID()] {
-		if nid == bn.node.ID() {
+		// if the node that sent us this is already sending gossip to this nodeID, we don't have to as well.
+		if nid == bn.node.ID() || slices.Contains(bn.currentTopology[srcNode], nid) || nid == srcNode {
 			continue
 		}
 		bn.gossipCh <- gossipRequest{msg: m, node: nid, retryAt: time.Now()}
